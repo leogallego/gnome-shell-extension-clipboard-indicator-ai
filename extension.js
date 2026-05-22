@@ -1636,11 +1636,12 @@ const ClipboardIndicator = GObject.registerClass({
 
 
 
-    #pasteItem (menuItem) {
+    async #pasteItem (menuItem) {
         this.menu.close();
         const currentlySelected = this._getCurrentlySelectedItem();
+        const shouldRestore = !PASTE_ON_SELECT && currentlySelected && currentlySelected !== menuItem;
         this.preventIndicatorUpdate = true;
-        this.#updateClipboard(menuItem.entry);
+        await this.#updateClipboard(menuItem.entry);
         this._pastingKeypressTimeout = setTimeout(() => {
             if (this.keyboard.purpose === Clutter.InputContentPurpose.TERMINAL) {
                 this.keyboard.press(Clutter.KEY_Control_L);
@@ -1657,10 +1658,10 @@ const ClipboardIndicator = GObject.registerClass({
                 this.keyboard.release(Clutter.KEY_Shift_L);
             }
 
-            this._pastingResetTimeout = setTimeout(() => {
+            this._pastingResetTimeout = setTimeout(async () => {
                 this.preventIndicatorUpdate = false;
-                if (currentlySelected && currentlySelected.entry)
-                    this.#updateClipboard(currentlySelected.entry);
+                if (shouldRestore && currentlySelected.entry)
+                    await this.#updateClipboard(currentlySelected.entry);
             }, 50);
         }, 50);
     }

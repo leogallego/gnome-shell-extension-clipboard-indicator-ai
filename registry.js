@@ -34,7 +34,7 @@ export class Registry {
             else if (entry.isImage()) {
                 const filename = this.getEntryFilename(entry);
                 item.contents = filename;
-                this.writeEntryFile(entry);
+                if (entry.hasBytes()) this.writeEntryFile(entry);
             }
 
             if (entry.getTag()) item.tag = entry.getTag();
@@ -146,7 +146,8 @@ export class Registry {
     async getEntryAsImage (entry) {
         if (entry.isImage() === false) return;
 
-        if (this.#entryFileExists(entry) == false) {
+        if (this.#entryFileExists(entry) === false) {
+            if (!entry.hasBytes()) return;
             await this.writeEntryFile(entry);
         }
 
@@ -159,6 +160,7 @@ export class Registry {
         if (entry.isImage() === false) return null;
 
         if (this.#entryFileExists(entry) === false) {
+            if (!entry.hasBytes()) return null;
             await this.writeEntryFile(entry);
         }
 
@@ -168,6 +170,7 @@ export class Registry {
     }
 
     getEntryFilename (entry) {
+        if (entry.getFilePath()) return entry.getFilePath();
         return `${this.REGISTRY_DIR}/${entry.asBytes().hash()}`;
     }
 
@@ -204,18 +207,45 @@ export class Registry {
         }
     }
 
-    clearCacheFolder() {
-
-        const CANCELLABLE = null;
+    cleanOrphanedFiles (referencedPaths) {
         try {
             const folder = Gio.file_new_for_path(this.REGISTRY_DIR);
-            const enumerator = folder.enumerate_children("", 1, CANCELLABLE);
+            const enumerator = folder.enumerate_children(
+                'standard::name', FileQueryInfoFlags.NONE, null);
 
-            let file;
-            while ((file = enumerator.iterate(CANCELLABLE)[2]) != null) {
-                file.delete(CANCELLABLE);
+            let orphanCount = 0;
+            let info;
+            while ((info = enumerator.next_file(null)) !== null) {
+                const name = info.get_name();
+                if (name === this.REGISTRY_FILE || name === this.REGISTRY_FILE + '~')
+                    continue;
+
+                const filePath = `${this.REGISTRY_DIR}/${name}`;
+                if (!referencedPaths.has(filePath)) {
+                    const file = Gio.file_new_for_path(filePath);
+                    file.delete_async(GLib.PRIORITY_LOW, null, null);
+                    orphanCount++;
+                }
             }
 
+            if (orphanCount > 0) {
+                console.log(`Clipboard Indicator: removed ${orphanCount} orphaned cache file(s)`);
+            }
+        }
+        catch (e) {
+            console.error('Clipboard Indicator: failed to clean orphaned files', e);
+        }
+    }
+
+    clearCacheFolder() {
+        try {
+            const folder = Gio.file_new_for_path(this.REGISTRY_DIR);
+            const enumerator = folder.enumerate_children("", 1, null);
+
+            let file;
+            while ((file = enumerator.iterate(null)[2]) != null) {
+                file.delete(null);
+            }
         }
         catch (e) {
             console.error(e);
@@ -227,6 +257,8 @@ export class ClipboardEntry {
     #mimetype;
     #bytes;
     #favorite;
+    #filePath = null;
+    #hash = null;
 
     static #decode (contents) {
         return Uint8Array.from(contents.match(/.{1,2}/g).map((byte) => parseInt(byte, 16)));
@@ -238,49 +270,29 @@ export class ClipboardEntry {
             mimetype === 'UTF8_STRING';
     }
 
+    static fromCachedImage (mimetype, filePath, favorite) {
+        const entry = new ClipboardEntry(mimetype, null, favorite);
+        entry.#filePath = filePath;
+        const parts = filePath.split('/');
+        entry.#hash = parts[parts.length - 1];
+        return entry;
+    }
+
     static async fromJSON (jsonEntry) {
         const mimetype = jsonEntry.mimetype || 'text/plain;charset=utf-8';
         const favorite = jsonEntry.favorite;
-        let bytes;
 
         if (ClipboardEntry.__isText(mimetype)) {
-            bytes = new TextEncoder().encode(jsonEntry.contents);
-        }
-        else {
-            const filename = jsonEntry.contents;
-            if (!GLib.file_test(filename, FileTest.EXISTS)) return null;
-
-            let file = Gio.file_new_for_path(filename);
-
-            const contentType = await file.query_info_async('*', FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, null, (obj, res) => {
-                try {
-                    const fileInfo = obj.query_info_finish(res);
-                    return fileInfo.get_content_type();
-                } catch (e) {
-                    console.error(e);
-                }
-            });
-
-            if (contentType && !contentType.startsWith('image/') && !contentType.startsWith('text/')) {
-                bytes = new TextEncoder().encode(jsonEntry.contents);
-            }
-            else {
-                bytes = await new Promise((resolve, reject) => file.load_contents_async(null, (obj, res) => {
-                    let [success, contents] = obj.load_contents_finish(res);
-
-                    if (success) {
-                        resolve(contents);
-                    }
-                    else {
-                        reject(
-                            new Error('Clipboard Indicator: could not read image file from cache')
-                        );
-                    }
-                }));
-            }
+            const bytes = new TextEncoder().encode(jsonEntry.contents);
+            const entry = new ClipboardEntry(mimetype, bytes, favorite);
+            if (jsonEntry.tag) entry.setTag(jsonEntry.tag);
+            return entry;
         }
 
-        const entry = new ClipboardEntry(mimetype, bytes, favorite);
+        const filename = jsonEntry.contents;
+        if (!GLib.file_test(filename, FileTest.EXISTS)) return null;
+
+        const entry = ClipboardEntry.fromCachedImage(mimetype, filename, favorite);
         if (jsonEntry.tag) entry.setTag(jsonEntry.tag);
         return entry;
     }
@@ -303,6 +315,7 @@ export class ClipboardEntry {
 
     getStringValue () {
         if (this.isImage()) {
+            if (this.#hash) return `[Image ${this.#hash}]`;
             return `[Image ${this.asBytes().hash()}]`;
         }
         return new TextDecoder().decode(this.#bytes);
@@ -345,6 +358,35 @@ export class ClipboardEntry {
 
     asBytes () {
         return GLib.Bytes.new(this.#bytes);
+    }
+
+    hasBytes () {
+        return this.#bytes !== null;
+    }
+
+    async loadBytes () {
+        if (this.#bytes !== null || !this.#filePath) return;
+
+        return new Promise((resolve, reject) => {
+            const file = Gio.file_new_for_path(this.#filePath);
+            file.load_contents_async(null, (obj, res) => {
+                let [success, contents] = obj.load_contents_finish(res);
+                if (success) {
+                    this.#bytes = contents;
+                    resolve();
+                } else {
+                    reject(new Error(`Clipboard Indicator: could not load image from ${this.#filePath}`));
+                }
+            });
+        });
+    }
+
+    releaseBytes () {
+        if (this.#filePath) this.#bytes = null;
+    }
+
+    getFilePath () {
+        return this.#filePath;
     }
 
     equals (otherEntry) {
